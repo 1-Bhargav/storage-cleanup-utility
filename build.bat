@@ -12,7 +12,7 @@ REM ============================================================
 echo.
 echo Installing build dependencies...
 python -m pip install --upgrade pip
-python -m pip install pyinstaller==6.11.1 send2trash==1.8.3
+python -m pip install pyinstaller==6.11.1 send2trash==1.8.3 pywin32==308
 if errorlevel 1 (
     echo.
     echo ERROR: Could not install dependencies.
@@ -26,6 +26,9 @@ echo Building Storage_Cleanup_Utility.exe ...
 pyinstaller --onefile --windowed --noconfirm ^
     --name "Storage_Cleanup_Utility" ^
     --hidden-import "send2trash" ^
+    --hidden-import "win32com" ^
+    --hidden-import "win32com.client" ^
+    --hidden-import "pywintypes" ^
     --collect-all "send2trash" ^
     storage_cleanup_utility.py
 
