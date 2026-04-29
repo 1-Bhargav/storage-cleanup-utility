@@ -2,21 +2,29 @@
 Storage Cleanup Utility
 ------------------------
 A portable Windows utility to scan and delete files older than a configurable
-age threshold. Includes protected system-path checks, dry-run, recycle-bin
-option, and independent file-level selection.
+age threshold. Includes protected system-path checks, user exclusions,
+dry-run, recycle-bin option, independent file-level selection, and Windows
+Task Scheduler integration for automated scan + export.
+
+Features:
+- Two interactive modes: Scan & Export, Review & Delete
+- Settings & Schedules: user exclusion paths/patterns, scheduled scans
+- Headless command-line mode for scheduled execution
 
 Author: Built with Claude (Anthropic)
 """
 
-import os
-import sys
+import argparse
 import csv
+import fnmatch
 import json
-import shutil
-import threading
+import os
 import queue
+import sys
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -26,17 +34,28 @@ try:
 except ImportError:
     SEND2TRASH_AVAILABLE = False
 
+# pywin32 is only available on Windows. We use it for Task Scheduler.
+TASK_SCHED_AVAILABLE = False
+try:
+    if os.name == "nt":
+        import win32com.client  # noqa: F401
+        import pywintypes  # noqa: F401
+        TASK_SCHED_AVAILABLE = True
+except ImportError:
+    TASK_SCHED_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Storage Cleanup Utility"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # Log and state directory in the user's Documents folder
 USER_DOCS = Path(os.path.expanduser("~")) / "Documents" / "StorageCleanupUtility"
 LOG_DIR = USER_DOCS / "logs"
+SCHEDULE_DIR = USER_DOCS / "schedules"
 STATE_FILE = USER_DOCS / "state.json"
 
 # Protected system paths — scanning/deleting these is blocked.
@@ -70,8 +89,9 @@ SYSTEM_DRIVE = os.environ.get("SystemDrive", "C:").upper()
 # ---------------------------------------------------------------------------
 
 def ensure_dirs():
-    """Create log and state directories if they don't exist."""
+    """Create log, schedule, and state directories if they don't exist."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    SCHEDULE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def format_size(size_bytes):
@@ -144,6 +164,87 @@ def to_long_path(path_str):
     return "\\\\?\\" + abspath
 
 
+# ---------------------------------------------------------------------------
+# User exclusions
+# ---------------------------------------------------------------------------
+# A user exclusion entry is a dict:
+#   {
+#       "path":    "D:\\Backups\\Critical"  (or "" for pattern-only entry),
+#       "pattern": "*.pst"                  (or "" for path-only entry),
+#       "note":    "Legal hold — ticket #1234"
+#   }
+#
+# Matching rules:
+#   - If path is set and pattern is empty: any file under that path is excluded.
+#   - If pattern is set and path is empty: any file matching pattern is excluded
+#     (matched against base file name, case-insensitive).
+#   - If both are set: file must be under that path AND match the pattern.
+
+def _path_is_under(child, parent):
+    """Return True if 'child' equals 'parent' or is inside 'parent'."""
+    if not parent:
+        return False
+    try:
+        c = os.path.normcase(os.path.abspath(child))
+        p = os.path.normcase(os.path.abspath(parent))
+        return c == p or c.startswith(p + os.sep)
+    except Exception:
+        return False
+
+
+def file_is_excluded(file_path, file_name, exclusions):
+    """
+    Return (excluded, matching_entry) — True if any exclusion entry matches.
+    """
+    if not exclusions:
+        return False, None
+    fname_lower = (file_name or os.path.basename(file_path)).lower()
+    for ex in exclusions:
+        path_part = (ex.get("path") or "").strip()
+        pat_part = (ex.get("pattern") or "").strip()
+        if not path_part and not pat_part:
+            continue  # empty entry, ignore
+        path_match = True if not path_part else _path_is_under(file_path, path_part)
+        pat_match = True if not pat_part else fnmatch.fnmatch(fname_lower, pat_part.lower())
+        if path_match and pat_match:
+            return True, ex
+    return False, None
+
+
+def dir_is_inside_excluded_path(dir_path, exclusions):
+    """
+    Return True if dir_path is at or beneath any exclusion entry that has a
+    path set (regardless of pattern). This lets us prune entire subtrees
+    during the scan walk for efficiency.
+    """
+    if not exclusions:
+        return False
+    for ex in exclusions:
+        path_part = (ex.get("path") or "").strip()
+        if not path_part:
+            continue
+        if _path_is_under(dir_path, path_part):
+            return True
+    return False
+
+
+def validate_exclusion_entry(entry):
+    """Return (ok, error_msg). Both path and pattern can be empty individually,
+    but at least one must be set."""
+    path_part = (entry.get("path") or "").strip()
+    pat_part = (entry.get("pattern") or "").strip()
+    if not path_part and not pat_part:
+        return False, "Provide at least a path, a pattern, or both."
+    if path_part:
+        # Don't require it to exist — user may add exclusions for paths that
+        # might appear later (e.g. on a network share). But warn if obviously bad.
+        if any(ch in path_part for ch in '<>"|?*') and not pat_part:
+            # < > | are illegal in paths; "*?" suggest the user mistook this for
+            # a pattern field
+            return False, "Path contains invalid characters. Did you mean to put it in the Pattern field?"
+    return True, ""
+
+
 def load_state():
     """Load last-used settings from state.json (best-effort)."""
     try:
@@ -178,13 +279,15 @@ class ScanWorker:
     Walks the filesystem recursively and reports:
       - per-file info (path, size, mtime, days old)
       - skipped entries (permission / other errors)
+      - excluded entries (matched user exclusion rules)
       - progress updates
     Uses a queue to communicate with the GUI thread.
     """
 
-    def __init__(self, root_path, age_days, out_queue, cancel_event):
+    def __init__(self, root_path, age_days, exclusions, out_queue, cancel_event):
         self.root_path = root_path
         self.age_days = age_days
+        self.exclusions = exclusions or []
         self.queue = out_queue
         self.cancel_event = cancel_event
 
@@ -195,6 +298,8 @@ class ScanWorker:
 
             files_found = []
             skipped = []
+            excluded_paths = []   # excluded files (so user can audit)
+            excluded_dirs = []    # pruned subtrees
             files_checked = 0
 
             walk_root = to_long_path(self.root_path)
@@ -210,12 +315,43 @@ class ScanWorker:
                 elif display_dir.startswith("\\\\?\\"):
                     display_dir = display_dir[len("\\\\?\\"):]
 
+                # Prune subdirs that fall under a path-only exclusion
+                kept_dirs = []
+                for d in dirnames:
+                    sub_display = os.path.join(display_dir, d)
+                    if dir_is_inside_excluded_path(sub_display, self.exclusions):
+                        # Check that the exclusion has NO pattern (path-only).
+                        # If any matching exclusion has a pattern, we still need
+                        # to descend to evaluate per-file.
+                        only_path_match = False
+                        for ex in self.exclusions:
+                            ppart = (ex.get("path") or "").strip()
+                            patpart = (ex.get("pattern") or "").strip()
+                            if ppart and not patpart and _path_is_under(sub_display, ppart):
+                                only_path_match = True
+                                break
+                        if only_path_match:
+                            excluded_dirs.append(sub_display)
+                            continue
+                    kept_dirs.append(d)
+                dirnames[:] = kept_dirs
+
                 for name in filenames:
                     if self.cancel_event.is_set():
                         break
                     files_checked += 1
                     full = os.path.join(dirpath, name)
                     display_full = os.path.join(display_dir, name)
+
+                    # Apply user exclusions (path + pattern, or either)
+                    ex_hit, ex_entry = file_is_excluded(display_full, name, self.exclusions)
+                    if ex_hit:
+                        excluded_paths.append({
+                            "path": display_full,
+                            "rule": _format_excl_rule(ex_entry),
+                        })
+                        continue
+
                     try:
                         st = os.stat(full)
                         if st.st_mtime <= cutoff_ts:
@@ -241,25 +377,21 @@ class ScanWorker:
                             "checked": files_checked,
                             "matched": len(files_found),
                             "skipped": len(skipped),
+                            "excluded": len(excluded_paths) + len(excluded_dirs),
                             "current": display_dir,
                         }))
 
-            if self.cancel_event.is_set():
-                self.queue.put(("cancelled", {
-                    "checked": files_checked,
-                    "matched": len(files_found),
-                    "skipped": len(skipped),
-                    "files": files_found,
-                    "skipped_list": skipped,
-                }))
-            else:
-                self.queue.put(("done", {
-                    "checked": files_checked,
-                    "matched": len(files_found),
-                    "skipped": len(skipped),
-                    "files": files_found,
-                    "skipped_list": skipped,
-                }))
+            payload = {
+                "checked": files_checked,
+                "matched": len(files_found),
+                "skipped": len(skipped),
+                "excluded": len(excluded_paths) + len(excluded_dirs),
+                "files": files_found,
+                "skipped_list": skipped,
+                "excluded_files": excluded_paths,
+                "excluded_dirs": excluded_dirs,
+            }
+            self.queue.put(("cancelled" if self.cancel_event.is_set() else "done", payload))
 
         except Exception as e:
             self.queue.put(("error", {"message": str(e)}))
@@ -275,6 +407,20 @@ class ScanWorker:
             pass
 
 
+def _format_excl_rule(entry):
+    """Human-readable form of an exclusion entry."""
+    if not entry:
+        return ""
+    parts = []
+    if entry.get("path"):
+        parts.append(f"path={entry['path']}")
+    if entry.get("pattern"):
+        parts.append(f"pattern={entry['pattern']}")
+    if entry.get("note"):
+        parts.append(f"note={entry['note']}")
+    return " | ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Deletion worker
 # ---------------------------------------------------------------------------
@@ -286,11 +432,12 @@ class DeleteWorker:
     """
 
     def __init__(self, file_paths, use_recycle_bin, cleanup_empty_dirs,
-                 cleanup_roots, out_queue, cancel_event):
+                 cleanup_roots, out_queue, cancel_event, scan_root=None):
         self.file_paths = file_paths
         self.use_recycle_bin = use_recycle_bin
         self.cleanup_empty_dirs = cleanup_empty_dirs
         self.cleanup_roots = cleanup_roots  # set of parent dirs to check for emptiness
+        self.scan_root = scan_root  # bound for ancestor walk; None = no ancestor walk
         self.queue = out_queue
         self.cancel_event = cancel_event
 
@@ -369,7 +516,9 @@ class DeleteWorker:
         }))
 
     def _remove_empty_recursive(self, dirpath, removed, failed):
-        """Bottom-up: remove dirpath and ancestors if they become empty."""
+        """Bottom-up: remove dirpath and any of its subdirectories that are
+        now empty. Then walk up to ancestors (bounded by scan_root) and
+        remove any that became empty as a result."""
         try:
             long_dir = to_long_path(dirpath)
             if not os.path.isdir(long_dir):
@@ -378,7 +527,6 @@ class DeleteWorker:
             for root, dirs, files in os.walk(long_dir, topdown=False):
                 if files:
                     continue
-                # Check each subdirectory
                 try:
                     if not os.listdir(root):
                         display = root
@@ -386,14 +534,399 @@ class DeleteWorker:
                             display = "\\\\" + display[len("\\\\?\\UNC\\"):]
                         elif display.startswith("\\\\?\\"):
                             display = display[len("\\\\?\\"):]
-                        # Don't remove the scan root itself — only its subfolders
-                        # (safer default)
                         os.rmdir(root)
                         removed.append(display)
                 except Exception as e:
                     failed.append({"path": root, "reason": str(e)})
+
+            # Walk up ancestors but only as long as we stay strictly inside
+            # the scan_root. We never delete the scan_root itself or anything
+            # above it. This is the safest behavior.
+            if self.scan_root:
+                self._remove_empty_ancestors(dirpath, removed, failed)
         except Exception as e:
             failed.append({"path": dirpath, "reason": str(e)})
+
+    def _remove_empty_ancestors(self, dirpath, removed, failed):
+        """Walk from dirpath upward, removing each folder that is empty.
+        Stops at the scan_root boundary or at the first non-empty ancestor."""
+        try:
+            scan_root_norm = os.path.normcase(os.path.abspath(self.scan_root))
+            current = os.path.abspath(dirpath)
+            while True:
+                parent = os.path.dirname(current)
+                if not parent or parent == current:
+                    break
+                parent_norm = os.path.normcase(os.path.abspath(parent))
+                # Critical safety: never go at or above the scan root
+                if parent_norm == scan_root_norm:
+                    break
+                if not parent_norm.startswith(scan_root_norm + os.sep):
+                    break
+                long_p = to_long_path(parent)
+                try:
+                    if not os.path.isdir(long_p):
+                        break
+                    if os.listdir(long_p):
+                        break  # has siblings, stop here
+                    os.rmdir(long_p)
+                    display = parent
+                    if display.startswith("\\\\?\\UNC\\"):
+                        display = "\\\\" + display[len("\\\\?\\UNC\\"):]
+                    elif display.startswith("\\\\?\\"):
+                        display = display[len("\\\\?\\"):]
+                    removed.append(display)
+                    current = parent
+                except Exception:
+                    break
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Windows Task Scheduler integration
+# ---------------------------------------------------------------------------
+
+# Folder name used inside Task Scheduler to group all tasks created by this app
+TASK_FOLDER = "\\StorageCleanupUtility"
+TASK_PREFIX = "SCU_"   # all task names start with this so we can list them
+
+# Trigger frequency constants from Task Scheduler COM API
+TASK_TRIGGER_DAILY   = 2
+TASK_TRIGGER_WEEKLY  = 3
+TASK_TRIGGER_MONTHLY = 4
+
+# Action type constants
+TASK_ACTION_EXEC = 0
+
+# Logon type
+TASK_LOGON_INTERACTIVE_TOKEN = 3   # current-user, runs only when logged in
+TASK_LOGON_PASSWORD = 1            # store password, runs whether logged in or not
+
+# Task creation flags
+TASK_CREATE_OR_UPDATE = 6
+
+
+def _ts_get_root_folder():
+    """Return Task Scheduler root folder, creating our subfolder if missing."""
+    if not TASK_SCHED_AVAILABLE:
+        raise RuntimeError("Task Scheduler integration requires pywin32 and Windows.")
+    scheduler = win32com.client.Dispatch("Schedule.Service")
+    scheduler.Connect()
+    root = scheduler.GetFolder("\\")
+    try:
+        return scheduler.GetFolder(TASK_FOLDER)
+    except Exception:
+        root.CreateFolder(TASK_FOLDER)
+        return scheduler.GetFolder(TASK_FOLDER)
+
+
+def _ts_scheduler():
+    scheduler = win32com.client.Dispatch("Schedule.Service")
+    scheduler.Connect()
+    return scheduler
+
+
+def _exe_invocation():
+    """
+    Return (program_path, base_args) needed to launch this utility headlessly.
+    When running as a frozen exe, sys.executable IS the exe.
+    When running as a script, we run pythonw with the script path.
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable, ""
+    # Script mode (developer / unfrozen): rare in production, but support it
+    py = sys.executable.replace("python.exe", "pythonw.exe")
+    return py, f'"{os.path.abspath(__file__)}"'
+
+
+def schedule_create(name, scan_path, age_days, export_dir, exclusions,
+                    frequency, time_hhmm, day_of_week=None, day_of_month=None,
+                    run_when_not_logged_in=False, password=None):
+    """
+    Create or update a Windows scheduled task that runs this utility in headless
+    scan+export mode.
+
+    Args:
+      name: friendly task name (will be prefixed with TASK_PREFIX)
+      scan_path: folder to scan
+      age_days: age threshold
+      export_dir: where the CSV will be written
+      exclusions: list of exclusion entries (will be passed via a temp file)
+      frequency: 'daily' | 'weekly' | 'monthly'
+      time_hhmm: 'HH:MM' (24-hour)
+      day_of_week: for weekly — int 1..7 (Sun..Sat) bitmask supported but we use single
+      day_of_month: for monthly — int 1..31
+      run_when_not_logged_in: bool
+      password: optional, required if run_when_not_logged_in is True
+    """
+    if not TASK_SCHED_AVAILABLE:
+        raise RuntimeError("Task Scheduler integration is not available on this system.")
+
+    folder = _ts_get_root_folder()
+    scheduler = _ts_scheduler()
+    task_def = scheduler.NewTask(0)
+
+    reg_info = task_def.RegistrationInfo
+    reg_info.Description = (
+        f"Storage Cleanup Utility scheduled scan of {scan_path} "
+        f"(files older than {age_days} days)"
+    )
+    reg_info.Author = "Storage Cleanup Utility"
+
+    settings = task_def.Settings
+    settings.Enabled = True
+    settings.StartWhenAvailable = True   # catch up if PC was off at scheduled time
+    settings.AllowDemandStart = True      # supports "Run Now"
+    settings.ExecutionTimeLimit = "PT4H"  # cap a runaway scan at 4h
+    settings.MultipleInstances = 2        # IgnoreNew — skip if previous still running
+    settings.DisallowStartIfOnBatteries = False
+    settings.StopIfGoingOnBatteries = False
+
+    # Trigger
+    triggers = task_def.Triggers
+    hh, mm = [int(x) for x in time_hhmm.split(":")]
+    start_dt = datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if start_dt < datetime.now():
+        start_dt += timedelta(days=1)
+    start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    if frequency == "daily":
+        t = triggers.Create(TASK_TRIGGER_DAILY)
+        t.DaysInterval = 1
+    elif frequency == "weekly":
+        t = triggers.Create(TASK_TRIGGER_WEEKLY)
+        t.WeeksInterval = 1
+        # day_of_week stored as a bitmask: 1=Sun, 2=Mon, 4=Tue, 8=Wed, 16=Thu, 32=Fri, 64=Sat
+        dow_map = {1: 1, 2: 2, 3: 4, 4: 8, 5: 16, 6: 32, 7: 64}
+        t.DaysOfWeek = dow_map.get(day_of_week or 2, 2)
+    elif frequency == "monthly":
+        t = triggers.Create(TASK_TRIGGER_MONTHLY)
+        t.MonthsOfYear = 4095   # all 12 months
+        t.DaysOfMonth = 1 << ((day_of_month or 1) - 1)
+    else:
+        raise ValueError(f"Unsupported frequency: {frequency}")
+
+    t.StartBoundary = start_iso
+    t.Enabled = True
+
+    # Action — invoke our exe in headless mode. We persist exclusions to a
+    # JSON sidecar so we don't need a long command-line.
+    program, base_args = _exe_invocation()
+    sidecar = SCHEDULE_DIR / f"{TASK_PREFIX}{_safe_task_name(name)}.json"
+    ensure_dirs()
+    SCHEDULE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "scan_path": scan_path,
+        "age_days": age_days,
+        "export_dir": export_dir,
+        "exclusions": exclusions or [],
+        "task_name": name,
+    }
+    with open(sidecar, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    args = f'{base_args} --headless-from "{sidecar}"'.strip()
+    action = task_def.Actions.Create(TASK_ACTION_EXEC)
+    action.Path = program
+    action.Arguments = args
+    action.WorkingDirectory = str(USER_DOCS)
+
+    # Principal (security context)
+    principal = task_def.Principal
+    principal.RunLevel = 0  # least privilege
+    if run_when_not_logged_in and password:
+        principal.LogonType = TASK_LOGON_PASSWORD
+        username = os.environ.get("USERNAME", "")
+        full_name = f"{os.environ.get('USERDOMAIN', '')}\\{username}" if os.environ.get('USERDOMAIN') else username
+        principal.UserId = full_name
+        folder.RegisterTaskDefinition(
+            TASK_PREFIX + _safe_task_name(name),
+            task_def,
+            TASK_CREATE_OR_UPDATE,
+            full_name, password, TASK_LOGON_PASSWORD, ""
+        )
+    else:
+        principal.LogonType = TASK_LOGON_INTERACTIVE_TOKEN
+        folder.RegisterTaskDefinition(
+            TASK_PREFIX + _safe_task_name(name),
+            task_def,
+            TASK_CREATE_OR_UPDATE,
+            "", "", TASK_LOGON_INTERACTIVE_TOKEN, ""
+        )
+
+    return TASK_PREFIX + _safe_task_name(name)
+
+
+def _safe_task_name(name):
+    """Strip characters not allowed in Task Scheduler names."""
+    safe = "".join(c for c in name if c.isalnum() or c in " _-")
+    safe = safe.strip().replace("  ", " ")
+    return safe or "Schedule"
+
+
+def schedule_list():
+    """Return a list of dicts describing all schedules created by this app."""
+    if not TASK_SCHED_AVAILABLE:
+        return []
+    try:
+        folder = _ts_get_root_folder()
+        out = []
+        for task in folder.GetTasks(0):
+            try:
+                xml = task.Xml
+            except Exception:
+                xml = ""
+            out.append({
+                "name": task.Name,
+                "enabled": bool(task.Enabled),
+                "state": task.State,   # 1=disabled, 3=ready, 4=running
+                "last_run": str(task.LastRunTime) if task.LastRunTime else "",
+                "next_run": str(task.NextRunTime) if task.NextRunTime else "",
+                "last_result": task.LastTaskResult,
+                "_task": task,  # keep a handle for delete/run-now
+            })
+        return out
+    except Exception:
+        return []
+
+
+def schedule_delete(task_name):
+    if not TASK_SCHED_AVAILABLE:
+        raise RuntimeError("Task Scheduler integration not available.")
+    folder = _ts_get_root_folder()
+    folder.DeleteTask(task_name, 0)
+    # remove sidecar
+    sidecar = SCHEDULE_DIR / f"{task_name}.json"
+    try:
+        sidecar.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def schedule_run_now(task_name):
+    if not TASK_SCHED_AVAILABLE:
+        raise RuntimeError("Task Scheduler integration not available.")
+    folder = _ts_get_root_folder()
+    task = folder.GetTask(task_name)
+    task.Run("")
+
+
+def schedule_set_enabled(task_name, enabled):
+    if not TASK_SCHED_AVAILABLE:
+        raise RuntimeError("Task Scheduler integration not available.")
+    folder = _ts_get_root_folder()
+    task = folder.GetTask(task_name)
+    task.Enabled = bool(enabled)
+
+
+# ---------------------------------------------------------------------------
+# Headless mode (launched by Task Scheduler)
+# ---------------------------------------------------------------------------
+
+def run_headless(sidecar_path):
+    """
+    Headless scan + export, driven by a JSON sidecar produced when the task
+    was created. Runs without showing any GUI. Logs to the standard logs folder.
+    """
+    ensure_dirs()
+    log_path = LOG_DIR / f"scheduled_run_{timestamp_for_filename()}.log"
+
+    def log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as f:
+            spec = json.load(f)
+    except Exception as e:
+        log(f"FATAL: could not read sidecar {sidecar_path}: {e}")
+        return 2
+
+    scan_path = spec.get("scan_path", "")
+    age_days = int(spec.get("age_days", 30))
+    export_dir = spec.get("export_dir", "") or str(USER_DOCS / "scheduled_exports")
+    exclusions = spec.get("exclusions", []) or []
+    task_name = spec.get("task_name", "Schedule")
+
+    log(f"Starting scheduled scan task='{task_name}' path='{scan_path}' age={age_days}")
+
+    blocked, reason = is_protected_path(scan_path)
+    if blocked:
+        log(f"BLOCKED: {reason}")
+        return 3
+
+    if not os.path.isdir(scan_path):
+        log(f"FAILED: scan path is not a folder: {scan_path}")
+        return 4
+
+    Path(export_dir).mkdir(parents=True, exist_ok=True)
+
+    # Run scan synchronously (we're in a background process anyway)
+    q = queue.Queue()
+    cancel = threading.Event()
+    worker = ScanWorker(scan_path, age_days, exclusions, q, cancel)
+    worker.run()
+
+    # Drain queue, find the final 'done' or 'cancelled' message
+    final = None
+    while True:
+        try:
+            msg, data = q.get_nowait()
+        except queue.Empty:
+            break
+        if msg in ("done", "cancelled", "error"):
+            final = (msg, data)
+
+    if not final:
+        log("FAILED: scan produced no final result")
+        return 5
+
+    msg, data = final
+    if msg == "error":
+        log(f"FAILED: scan error: {data.get('message')}")
+        return 6
+
+    files = data["files"]
+    skipped = data["skipped_list"]
+
+    # Export CSV
+    csv_name = f"scheduled_{_safe_task_name(task_name)}_{timestamp_for_filename()}.csv"
+    csv_path = Path(export_dir) / csv_name
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["FullPath", "FileName", "ParentFolder", "SizeBytes", "SizeReadable",
+                        "LastModified", "DaysOld", "Selected"])
+            for r in files:
+                w.writerow([
+                    r["path"], r["name"], r["parent"], r["size"],
+                    format_size(r["size"]),
+                    r["mtime"].strftime("%Y-%m-%d %H:%M:%S"),
+                    r["days_old"], "Yes",
+                ])
+        log(f"Exported {len(files):,} files to {csv_path}")
+    except Exception as e:
+        log(f"FAILED: could not write CSV: {e}")
+        return 7
+
+    if skipped:
+        skipped_path = csv_path.with_name(csv_path.stem + "_skipped.csv")
+        try:
+            with open(skipped_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["Path", "Reason"])
+                for s in skipped:
+                    w.writerow([s["path"], s["reason"]])
+            log(f"Skipped entries: {len(skipped)} -> {skipped_path}")
+        except Exception as e:
+            log(f"WARN: could not write skipped CSV: {e}")
+
+    log(f"DONE. Matched {len(files):,} files, total size {format_size(sum(f['size'] for f in files))}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +940,8 @@ class StorageCleanupApp(tk.Tk):
         ensure_dirs()
 
         self.title(f"{APP_NAME} v{APP_VERSION}")
-        self.geometry("1100x720")
-        self.minsize(900, 600)
+        self.geometry("1180x760")
+        self.minsize(960, 640)
 
         # State
         self.scan_results = []       # list of dicts from ScanWorker
@@ -425,6 +958,8 @@ class StorageCleanupApp(tk.Tk):
         self.tree_items = {}   # item_id -> {"type": "folder"|"file", "path": ..., "size": ..., "checked": bool, "file_ref": dict|None}
 
         self.settings = load_state()
+        # User-defined exclusion entries — list of dicts {path, pattern, note}
+        self.exclusions = list(self.settings.get("exclusions", []))
 
         self._build_ui()
         self._poll_scan_queue()
@@ -451,11 +986,14 @@ class StorageCleanupApp(tk.Tk):
 
         self.scan_tab = ttk.Frame(self.nb)
         self.review_tab = ttk.Frame(self.nb)
+        self.settings_tab = ttk.Frame(self.nb)
         self.nb.add(self.scan_tab, text="  1.  Scan & Export  ")
         self.nb.add(self.review_tab, text="  2.  Review & Delete  ")
+        self.nb.add(self.settings_tab, text="  3.  Settings & Schedules  ")
 
         self._build_scan_tab()
         self._build_review_tab()
+        self._build_settings_tab()
 
         # Status bar
         self.status_var = tk.StringVar(value="Ready.")
@@ -507,7 +1045,7 @@ class StorageCleanupApp(tk.Tk):
         self.filter_var.trace_add("write", lambda *a: self._apply_scan_filter())
         ttk.Entry(mid, textvariable=self.filter_var, width=40).pack(side=tk.LEFT, padx=(4, 12))
 
-        self.scan_summary_var = tk.StringVar(value="Total files: 0   |   Total size: 0 B   |   Skipped: 0")
+        self.scan_summary_var = tk.StringVar(value="Total files: 0   |   Total size: 0 B   |   Skipped: 0   |   Excluded: 0")
         ttk.Label(mid, textvariable=self.scan_summary_var, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
 
         ttk.Button(mid, text="Export to CSV…", command=self._export_csv).pack(side=tk.RIGHT)
@@ -633,6 +1171,320 @@ class StorageCleanupApp(tk.Tk):
         self.del_progress = ttk.Progressbar(act, mode="determinate")
         self.del_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=12)
 
+    # ----------------------- SETTINGS & SCHEDULES TAB -----------------------
+
+    def _build_settings_tab(self):
+        f = self.settings_tab
+
+        # Two side-by-side sections: Exclusions on the left, Schedules on the right
+        paned = ttk.PanedWindow(f, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        # ---------- Exclusions section ----------
+        excl_frame = ttk.LabelFrame(paned, text="Exclusion Rules", padding=8)
+        paned.add(excl_frame, weight=1)
+
+        ttk.Label(
+            excl_frame,
+            text=("Files matching any rule below will be skipped during scan and delete.\n"
+                  "Provide a path, a filename pattern (e.g. *.pst, *important*), or both."),
+            foreground="#444",
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+
+        # Listbox of exclusions with columns
+        list_frame = ttk.Frame(excl_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ("path", "pattern", "note")
+        self.excl_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse", height=12)
+        self.excl_tree.heading("path", text="Path")
+        self.excl_tree.heading("pattern", text="Pattern")
+        self.excl_tree.heading("note", text="Note")
+        self.excl_tree.column("path", width=240, anchor="w")
+        self.excl_tree.column("pattern", width=110, anchor="w")
+        self.excl_tree.column("note", width=160, anchor="w")
+
+        ysb = ttk.Scrollbar(list_frame, orient="vertical", command=self.excl_tree.yview)
+        self.excl_tree.configure(yscrollcommand=ysb.set)
+        self.excl_tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+
+        btns = ttk.Frame(excl_frame)
+        btns.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btns, text="Add…", command=self._excl_add).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Edit…", command=self._excl_edit).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(btns, text="Remove", command=self._excl_remove).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Button(btns, text="Import CSV…", command=self._excl_import).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Export CSV…", command=self._excl_export).pack(side=tk.LEFT, padx=(4, 0))
+
+        self._refresh_excl_tree()
+
+        # ---------- Schedules section ----------
+        sched_frame = ttk.LabelFrame(paned, text="Scheduled Scans (Windows Task Scheduler)", padding=8)
+        paned.add(sched_frame, weight=1)
+
+        if not TASK_SCHED_AVAILABLE:
+            ttk.Label(
+                sched_frame,
+                text=("Task Scheduler integration is not available.\n"
+                      "Make sure you are on Windows and the build includes pywin32."),
+                foreground="#a00",
+                justify="left",
+            ).pack(anchor="w", pady=8)
+        else:
+            ttk.Label(
+                sched_frame,
+                text=("Schedules run scan + export automatically. They never delete.\n"
+                      "Each scan saves a CSV in the chosen export folder."),
+                foreground="#444",
+                justify="left",
+            ).pack(anchor="w", pady=(0, 6))
+
+            list_frame2 = ttk.Frame(sched_frame)
+            list_frame2.pack(fill=tk.BOTH, expand=True)
+            cols = ("name", "next_run", "last_run", "state")
+            self.sched_tree = ttk.Treeview(list_frame2, columns=cols, show="headings", selectmode="browse", height=10)
+            self.sched_tree.heading("name", text="Task Name")
+            self.sched_tree.heading("next_run", text="Next Run")
+            self.sched_tree.heading("last_run", text="Last Run")
+            self.sched_tree.heading("state", text="State")
+            self.sched_tree.column("name", width=180, anchor="w")
+            self.sched_tree.column("next_run", width=140, anchor="w")
+            self.sched_tree.column("last_run", width=140, anchor="w")
+            self.sched_tree.column("state", width=80, anchor="w")
+            ysb2 = ttk.Scrollbar(list_frame2, orient="vertical", command=self.sched_tree.yview)
+            self.sched_tree.configure(yscrollcommand=ysb2.set)
+            self.sched_tree.grid(row=0, column=0, sticky="nsew")
+            ysb2.grid(row=0, column=1, sticky="ns")
+            list_frame2.rowconfigure(0, weight=1)
+            list_frame2.columnconfigure(0, weight=1)
+
+            btns2 = ttk.Frame(sched_frame)
+            btns2.pack(fill=tk.X, pady=(6, 0))
+            ttk.Button(btns2, text="New Schedule…", command=self._sched_new).pack(side=tk.LEFT)
+            ttk.Button(btns2, text="Run Now", command=self._sched_run_now).pack(side=tk.LEFT, padx=(4, 0))
+            ttk.Button(btns2, text="Enable / Disable", command=self._sched_toggle).pack(side=tk.LEFT, padx=(4, 0))
+            ttk.Button(btns2, text="Delete", command=self._sched_delete).pack(side=tk.LEFT, padx=(4, 12))
+            ttk.Button(btns2, text="Refresh", command=self._refresh_sched_tree).pack(side=tk.LEFT)
+
+            self._refresh_sched_tree()
+
+    # ----------------------- Exclusions logic -----------------------
+
+    def _refresh_excl_tree(self):
+        for i in self.excl_tree.get_children():
+            self.excl_tree.delete(i)
+        for ex in self.exclusions:
+            self.excl_tree.insert(
+                "", tk.END,
+                values=(ex.get("path", ""), ex.get("pattern", ""), ex.get("note", "")),
+            )
+
+    def _save_exclusions(self):
+        self.settings["exclusions"] = self.exclusions
+        save_state(self.settings)
+
+    def _excl_add(self):
+        result = ExclusionDialog(self, "Add Exclusion").result
+        if not result:
+            return
+        ok, err = validate_exclusion_entry(result)
+        if not ok:
+            messagebox.showerror("Invalid entry", err)
+            return
+        self.exclusions.append(result)
+        self._save_exclusions()
+        self._refresh_excl_tree()
+
+    def _excl_edit(self):
+        sel = self.excl_tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select an exclusion to edit.")
+            return
+        idx = self.excl_tree.index(sel[0])
+        current = self.exclusions[idx]
+        result = ExclusionDialog(self, "Edit Exclusion", current).result
+        if not result:
+            return
+        ok, err = validate_exclusion_entry(result)
+        if not ok:
+            messagebox.showerror("Invalid entry", err)
+            return
+        self.exclusions[idx] = result
+        self._save_exclusions()
+        self._refresh_excl_tree()
+
+    def _excl_remove(self):
+        sel = self.excl_tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select an exclusion to remove.")
+            return
+        idx = self.excl_tree.index(sel[0])
+        if messagebox.askyesno("Remove exclusion", "Remove the selected exclusion?"):
+            self.exclusions.pop(idx)
+            self._save_exclusions()
+            self._refresh_excl_tree()
+
+    def _excl_export(self):
+        if not self.exclusions:
+            messagebox.showinfo("Nothing to export", "No exclusion rules defined.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export exclusion rules",
+            defaultextension=".csv",
+            initialfile=f"exclusions_{timestamp_for_filename()}.csv",
+            filetypes=[("CSV files", "*.csv")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["Path", "Pattern", "Note"])
+                for ex in self.exclusions:
+                    w.writerow([ex.get("path", ""), ex.get("pattern", ""), ex.get("note", "")])
+            messagebox.showinfo("Exported", f"Exclusion rules exported to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+    def _excl_import(self):
+        path = filedialog.askopenfilename(
+            title="Import exclusion rules CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            new_entries = []
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    entry = {
+                        "path": (row.get("Path") or row.get("path") or "").strip(),
+                        "pattern": (row.get("Pattern") or row.get("pattern") or "").strip(),
+                        "note": (row.get("Note") or row.get("note") or "").strip(),
+                    }
+                    ok, _ = validate_exclusion_entry(entry)
+                    if ok:
+                        new_entries.append(entry)
+            choice = messagebox.askyesnocancel(
+                "Import exclusions",
+                f"Imported {len(new_entries)} valid entries.\n\n"
+                f"Yes  = Replace existing rules\n"
+                f"No   = Append to existing rules\n"
+                f"Cancel = Abort"
+            )
+            if choice is None:
+                return
+            if choice:
+                self.exclusions = new_entries
+            else:
+                self.exclusions.extend(new_entries)
+            self._save_exclusions()
+            self._refresh_excl_tree()
+        except Exception as e:
+            messagebox.showerror("Import failed", str(e))
+
+    # ----------------------- Schedules logic -----------------------
+
+    def _refresh_sched_tree(self):
+        if not TASK_SCHED_AVAILABLE:
+            return
+        for i in self.sched_tree.get_children():
+            self.sched_tree.delete(i)
+        try:
+            tasks = schedule_list()
+        except Exception as e:
+            messagebox.showerror("Cannot list schedules", str(e))
+            return
+        state_map = {0: "Unknown", 1: "Disabled", 2: "Queued", 3: "Ready", 4: "Running"}
+        for t in tasks:
+            self.sched_tree.insert(
+                "", tk.END,
+                values=(t["name"], t.get("next_run") or "—", t.get("last_run") or "—",
+                        state_map.get(t.get("state"), "—"))
+            )
+
+    def _sched_new(self):
+        if not TASK_SCHED_AVAILABLE:
+            messagebox.showerror("Unavailable", "Task Scheduler integration not available.")
+            return
+        dlg = ScheduleDialog(self, exclusions=self.exclusions)
+        if not dlg.result:
+            return
+        spec = dlg.result
+        try:
+            task_name = schedule_create(
+                name=spec["name"],
+                scan_path=spec["scan_path"],
+                age_days=spec["age_days"],
+                export_dir=spec["export_dir"],
+                exclusions=spec["exclusions"],
+                frequency=spec["frequency"],
+                time_hhmm=spec["time"],
+                day_of_week=spec.get("day_of_week"),
+                day_of_month=spec.get("day_of_month"),
+                run_when_not_logged_in=spec.get("run_when_not_logged_in", False),
+                password=spec.get("password"),
+            )
+            messagebox.showinfo(
+                "Schedule created",
+                f"Created scheduled task:\n  {task_name}\n\n"
+                f"You can verify or edit it via the Windows Task Scheduler if needed.\n"
+                f"Use 'Run Now' to test it immediately."
+            )
+            self._refresh_sched_tree()
+        except Exception as e:
+            messagebox.showerror("Could not create schedule", str(e))
+
+    def _sched_selected_name(self):
+        sel = self.sched_tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a schedule from the list.")
+            return None
+        vals = self.sched_tree.item(sel[0], "values")
+        return vals[0] if vals else None
+
+    def _sched_run_now(self):
+        name = self._sched_selected_name()
+        if not name:
+            return
+        try:
+            schedule_run_now(name)
+            messagebox.showinfo("Triggered", f"Run-now triggered for:\n{name}\n\n"
+                                f"Check the export folder and the logs folder shortly.")
+            self._refresh_sched_tree()
+        except Exception as e:
+            messagebox.showerror("Run failed", str(e))
+
+    def _sched_toggle(self):
+        name = self._sched_selected_name()
+        if not name:
+            return
+        try:
+            tasks = schedule_list()
+            current = next((t for t in tasks if t["name"] == name), None)
+            new_state = not (current and current.get("enabled"))
+            schedule_set_enabled(name, new_state)
+            self._refresh_sched_tree()
+        except Exception as e:
+            messagebox.showerror("Toggle failed", str(e))
+
+    def _sched_delete(self):
+        name = self._sched_selected_name()
+        if not name:
+            return
+        if not messagebox.askyesno("Delete schedule", f"Delete this schedule?\n\n  {name}"):
+            return
+        try:
+            schedule_delete(name)
+            self._refresh_sched_tree()
+        except Exception as e:
+            messagebox.showerror("Delete failed", str(e))
+
     # ----------------------- Scan tab logic -----------------------
 
     def _browse_folder(self):
@@ -658,6 +1510,23 @@ class StorageCleanupApp(tk.Tk):
                 f"Cannot scan this location.\n\n{reason}"
             )
             return None
+
+        # If the user is trying to scan inside one of their own exclusions, warn
+        # (but allow with confirmation — user might want to scan a parent and
+        # let pattern exclusions filter out specific files within it).
+        for ex in self.exclusions:
+            ppart = (ex.get("path") or "").strip()
+            patpart = (ex.get("pattern") or "").strip()
+            if ppart and not patpart and _path_is_under(path, ppart):
+                if not messagebox.askyesno(
+                    "Path is in your exclusion list",
+                    f"The folder you are about to scan is inside an excluded path:\n\n"
+                    f"  {ppart}\n\n"
+                    f"With this exclusion in place, the entire scan would skip everything.\n\n"
+                    f"Continue anyway?"
+                ):
+                    return None
+                break
 
         try:
             age = int(self.age_var.get().strip())
@@ -691,9 +1560,9 @@ class StorageCleanupApp(tk.Tk):
         self.scan_cancel_btn.configure(state=tk.NORMAL)
         self.scan_progress.start(10)
         self.status_var.set(f"Scanning {path} …")
-        self._update_scan_summary(0, 0, 0)
+        self._update_scan_summary(0, 0, 0, 0)
 
-        worker = ScanWorker(path, age, self.scan_queue, self.scan_cancel)
+        worker = ScanWorker(path, age, self.exclusions, self.scan_queue, self.scan_cancel)
         self.scan_thread = threading.Thread(target=worker.run, daemon=True)
         self.scan_thread.start()
 
@@ -707,7 +1576,8 @@ class StorageCleanupApp(tk.Tk):
                 msg, data = self.scan_queue.get_nowait()
                 if msg == "progress":
                     self.status_var.set(
-                        f"Scanning… checked {data['checked']:,} | matched {data['matched']:,} | skipped {data['skipped']:,}"
+                        f"Scanning… checked {data['checked']:,} | matched {data['matched']:,} "
+                        f"| skipped {data['skipped']:,} | excluded {data.get('excluded', 0):,}"
                     )
                 elif msg == "walk_error":
                     self.skipped_results.append({"path": data["path"], "reason": data["reason"]})
@@ -717,12 +1587,22 @@ class StorageCleanupApp(tk.Tk):
                     self.scan_cancel_btn.configure(state=tk.DISABLED)
                     self.scan_results = data["files"]
                     self.skipped_results.extend(data["skipped_list"])
+                    # Stash excluded info so we can include it in the export
+                    self._last_excluded_files = data.get("excluded_files", [])
+                    self._last_excluded_dirs = data.get("excluded_dirs", [])
                     self._populate_scan_tree(self.scan_results)
                     total_size = sum(f["size"] for f in self.scan_results)
-                    self._update_scan_summary(len(self.scan_results), total_size, len(self.skipped_results))
+                    self._update_scan_summary(
+                        len(self.scan_results), total_size,
+                        len(self.skipped_results), data.get("excluded", 0)
+                    )
                     verb = "Cancelled" if msg == "cancelled" else "Scan complete"
+                    extra = ""
+                    if data.get("excluded", 0):
+                        extra = f", {data['excluded']:,} excluded by your rules"
                     self.status_var.set(
-                        f"{verb}. {len(self.scan_results):,} files matched, {format_size(total_size)} total."
+                        f"{verb}. {len(self.scan_results):,} files matched, "
+                        f"{format_size(total_size)} total{extra}."
                     )
                 elif msg == "error":
                     self.scan_progress.stop()
@@ -769,9 +1649,10 @@ class StorageCleanupApp(tk.Tk):
         self.scan_results.sort(key=key_map[col], reverse=rev)
         self._apply_scan_filter()
 
-    def _update_scan_summary(self, count, total_size, skipped_count):
+    def _update_scan_summary(self, count, total_size, skipped_count, excluded_count=0):
         self.scan_summary_var.set(
-            f"Total files: {count:,}   |   Total size: {format_size(total_size)}   |   Skipped: {skipped_count:,}"
+            f"Total files: {count:,}   |   Total size: {format_size(total_size)}   "
+            f"|   Skipped: {skipped_count:,}   |   Excluded: {excluded_count:,}"
         )
 
     def _export_csv(self):
@@ -1124,6 +2005,34 @@ class StorageCleanupApp(tk.Tk):
                 )
                 return
 
+        # Apply user exclusions as a final safety net (e.g., if user loaded an
+        # old CSV scanned without current exclusions). Excluded files are filtered
+        # out silently with a notification.
+        if self.exclusions:
+            kept = []
+            removed_by_excl = []
+            for f in sel:
+                hit, ex = file_is_excluded(f["path"], f["name"], self.exclusions)
+                if hit:
+                    removed_by_excl.append((f, ex))
+                else:
+                    kept.append(f)
+            if removed_by_excl:
+                if not messagebox.askyesno(
+                    "Files matched your exclusions",
+                    f"{len(removed_by_excl):,} of the {len(sel):,} selected files match your "
+                    f"current exclusion rules and will be SKIPPED.\n\n"
+                    f"Continue with deletion of the remaining {len(kept):,} files?"
+                ):
+                    return
+                sel = kept
+            if not sel:
+                messagebox.showinfo(
+                    "All selections excluded",
+                    "All selected files matched your exclusion rules. Nothing to delete."
+                )
+                return
+
         mode_label = "Recycle Bin" if self.delete_mode_var.get() == "recycle" else "Permanent Delete"
         total_size = sum(f["size"] for f in sel)
 
@@ -1163,6 +2072,14 @@ class StorageCleanupApp(tk.Tk):
         self.status_var.set(f"Deleting {len(sel):,} files ({mode_label})…")
 
         paths = [f["path"] for f in sel]
+        # Scan root is the path the user originally scanned. We use it to bound
+        # the empty-folder cleanup so we never delete folders above what was
+        # scanned. If the user loaded from CSV without scanning, we conservatively
+        # don't enable ancestor cleanup (still cleans up immediate empty parents).
+        scan_root = self.path_var.get().strip().strip('"') if self.path_var.get() else None
+        if scan_root and not os.path.isdir(scan_root):
+            scan_root = None
+
         worker = DeleteWorker(
             paths,
             use_recycle_bin=(self.delete_mode_var.get() == "recycle"),
@@ -1170,6 +2087,7 @@ class StorageCleanupApp(tk.Tk):
             cleanup_roots=cleanup_roots,
             out_queue=self.del_queue,
             cancel_event=self.del_cancel,
+            scan_root=scan_root,
         )
         self.del_thread = threading.Thread(target=worker.run, daemon=True)
         self.del_thread.start()
@@ -1266,10 +2184,326 @@ class StorageCleanupApp(tk.Tk):
 
 
 # ---------------------------------------------------------------------------
+# Modal dialogs for adding exclusions and creating schedules
+# ---------------------------------------------------------------------------
+
+class ExclusionDialog(tk.Toplevel):
+    """Modal dialog to add or edit an exclusion entry."""
+
+    def __init__(self, parent, title, current=None):
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+        current = current or {}
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(body, text="Path (folder or file). Leave blank for pattern-only rule:").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.path_var = tk.StringVar(value=current.get("path", ""))
+        ttk.Entry(body, textvariable=self.path_var, width=60).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        ttk.Button(body, text="Browse…", command=self._browse).grid(row=1, column=2, padx=(6, 0))
+
+        ttk.Label(body, text="Filename pattern (e.g. *.pst, *important*). Leave blank for path-only rule:").grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.pattern_var = tk.StringVar(value=current.get("pattern", ""))
+        ttk.Entry(body, textvariable=self.pattern_var, width=60).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+
+        ttk.Label(body, text="Note (optional):").grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.note_var = tk.StringVar(value=current.get("note", ""))
+        ttk.Entry(body, textvariable=self.note_var, width=60).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+
+        info = ttk.Label(
+            body,
+            text=("If both Path and Pattern are provided, a file must match BOTH to be excluded.\n"
+                  "If only one is provided, that one alone is enough to exclude a file."),
+            foreground="#555", justify="left",
+        )
+        info.grid(row=6, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+        btns = ttk.Frame(body)
+        btns.grid(row=7, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="OK", command=self._ok).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self._cancel())
+
+        self.update_idletasks()
+        # Center over parent
+        try:
+            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            pw, ph = parent.winfo_width(), parent.winfo_height()
+            w, h = self.winfo_width(), self.winfo_height()
+            self.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 2}")
+        except Exception:
+            pass
+
+        self.grab_set()
+        self.wait_window()
+
+    def _browse(self):
+        d = filedialog.askdirectory(title="Choose folder to exclude", parent=self)
+        if d:
+            self.path_var.set(os.path.normpath(d))
+
+    def _ok(self):
+        self.result = {
+            "path": self.path_var.get().strip(),
+            "pattern": self.pattern_var.get().strip(),
+            "note": self.note_var.get().strip(),
+        }
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class ScheduleDialog(tk.Toplevel):
+    """Modal dialog to create a new scheduled scan."""
+
+    def __init__(self, parent, exclusions):
+        super().__init__(parent)
+        self.title("Create Scheduled Scan")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+        self._parent_exclusions = exclusions or []
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # Friendly name
+        ttk.Label(body, text="Schedule name:").grid(row=0, column=0, sticky="w", pady=(0, 2))
+        self.name_var = tk.StringVar(value=f"Scan_{datetime.now().strftime('%Y%m%d')}")
+        ttk.Entry(body, textvariable=self.name_var, width=50).grid(row=0, column=1, columnspan=2, sticky="ew")
+
+        # Path
+        ttk.Label(body, text="Folder to scan:").grid(row=1, column=0, sticky="w", pady=(8, 2))
+        self.path_var = tk.StringVar()
+        ttk.Entry(body, textvariable=self.path_var, width=50).grid(row=1, column=1, sticky="ew")
+        ttk.Button(body, text="Browse…", command=self._browse_scan).grid(row=1, column=2, padx=(6, 0))
+
+        # Age
+        ttk.Label(body, text="Age threshold (days):").grid(row=2, column=0, sticky="w", pady=(8, 2))
+        self.age_var = tk.StringVar(value="30")
+        ttk.Entry(body, textvariable=self.age_var, width=10).grid(row=2, column=1, sticky="w")
+
+        # Export dir
+        ttk.Label(body, text="Export folder:").grid(row=3, column=0, sticky="w", pady=(8, 2))
+        default_export = str(USER_DOCS / "scheduled_exports")
+        self.export_var = tk.StringVar(value=default_export)
+        ttk.Entry(body, textvariable=self.export_var, width=50).grid(row=3, column=1, sticky="ew")
+        ttk.Button(body, text="Browse…", command=self._browse_export).grid(row=3, column=2, padx=(6, 0))
+
+        # Frequency
+        ttk.Label(body, text="Frequency:").grid(row=4, column=0, sticky="w", pady=(8, 2))
+        self.freq_var = tk.StringVar(value="weekly")
+        freq_cb = ttk.Combobox(body, textvariable=self.freq_var, state="readonly",
+                               values=["daily", "weekly", "monthly"], width=14)
+        freq_cb.grid(row=4, column=1, sticky="w")
+        freq_cb.bind("<<ComboboxSelected>>", lambda e: self._update_freq_widgets())
+
+        # Day-of-week (weekly)
+        self.dow_label = ttk.Label(body, text="Day of week:")
+        self.dow_label.grid(row=5, column=0, sticky="w", pady=(8, 2))
+        self.dow_var = tk.StringVar(value="Monday")
+        self.dow_cb = ttk.Combobox(body, textvariable=self.dow_var, state="readonly",
+                                   values=["Sunday", "Monday", "Tuesday", "Wednesday",
+                                           "Thursday", "Friday", "Saturday"], width=14)
+        self.dow_cb.grid(row=5, column=1, sticky="w")
+
+        # Day-of-month (monthly)
+        self.dom_label = ttk.Label(body, text="Day of month:")
+        self.dom_var = tk.StringVar(value="1")
+        self.dom_cb = ttk.Combobox(body, textvariable=self.dom_var, state="readonly",
+                                   values=[str(i) for i in range(1, 29)], width=14)
+
+        # Time
+        ttk.Label(body, text="Time of day (HH:MM, 24-hour):").grid(row=6, column=0, sticky="w", pady=(8, 2))
+        self.time_var = tk.StringVar(value="03:00")
+        ttk.Entry(body, textvariable=self.time_var, width=10).grid(row=6, column=1, sticky="w")
+
+        # Run-mode
+        ttk.Label(body, text="Run mode:").grid(row=7, column=0, sticky="w", pady=(8, 2))
+        self.runmode_var = tk.StringVar(value="logged_in")
+        rm_frame = ttk.Frame(body)
+        rm_frame.grid(row=7, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(rm_frame, text="Only when I'm logged in (no password needed)",
+                        variable=self.runmode_var, value="logged_in",
+                        command=self._update_pwd_state).pack(anchor="w")
+        ttk.Radiobutton(rm_frame, text="Whether I'm logged in or not (requires my Windows password)",
+                        variable=self.runmode_var, value="not_logged_in",
+                        command=self._update_pwd_state).pack(anchor="w")
+
+        # Password
+        self.pwd_label = ttk.Label(body, text="Windows password:")
+        self.pwd_label.grid(row=8, column=0, sticky="w", pady=(8, 2))
+        self.pwd_var = tk.StringVar(value="")
+        self.pwd_entry = ttk.Entry(body, textvariable=self.pwd_var, width=30, show="*")
+        self.pwd_entry.grid(row=8, column=1, sticky="w")
+
+        # Use exclusions checkbox
+        self.use_excl_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(body, text=f"Apply current exclusion rules ({len(self._parent_exclusions)} entries)",
+                        variable=self.use_excl_var).grid(row=9, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        # Buttons
+        btns = ttk.Frame(body)
+        btns.grid(row=10, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        ttk.Button(btns, text="Create Schedule", command=self._ok).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+
+        body.columnconfigure(1, weight=1)
+
+        self._update_freq_widgets()
+        self._update_pwd_state()
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
+
+        self.update_idletasks()
+        try:
+            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            pw, ph = parent.winfo_width(), parent.winfo_height()
+            w, h = self.winfo_width(), self.winfo_height()
+            self.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 2}")
+        except Exception:
+            pass
+
+        self.grab_set()
+        self.wait_window()
+
+    def _browse_scan(self):
+        d = filedialog.askdirectory(title="Choose folder to scan", parent=self)
+        if d:
+            self.path_var.set(os.path.normpath(d))
+
+    def _browse_export(self):
+        d = filedialog.askdirectory(title="Choose export folder", parent=self)
+        if d:
+            self.export_var.set(os.path.normpath(d))
+
+    def _update_freq_widgets(self):
+        freq = self.freq_var.get()
+        # Hide both, then show the relevant one
+        self.dow_label.grid_remove()
+        self.dow_cb.grid_remove()
+        self.dom_label.grid_remove()
+        self.dom_cb.grid_remove()
+        if freq == "weekly":
+            self.dow_label.grid(row=5, column=0, sticky="w", pady=(8, 2))
+            self.dow_cb.grid(row=5, column=1, sticky="w")
+        elif freq == "monthly":
+            self.dom_label.grid(row=5, column=0, sticky="w", pady=(8, 2))
+            self.dom_cb.grid(row=5, column=1, sticky="w")
+
+    def _update_pwd_state(self):
+        if self.runmode_var.get() == "not_logged_in":
+            self.pwd_entry.configure(state="normal")
+            self.pwd_label.configure(foreground="#000")
+        else:
+            self.pwd_entry.configure(state="disabled")
+            self.pwd_label.configure(foreground="#999")
+            self.pwd_var.set("")
+
+    def _ok(self):
+        # Validate
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showerror("Missing", "Schedule name is required.", parent=self)
+            return
+        scan_path = self.path_var.get().strip()
+        if not scan_path or not os.path.isdir(scan_path):
+            messagebox.showerror("Missing", "Please select a valid folder to scan.", parent=self)
+            return
+        blocked, reason = is_protected_path(scan_path)
+        if blocked:
+            messagebox.showerror("Protected path", reason, parent=self)
+            return
+        try:
+            age = int(self.age_var.get().strip())
+            if age < 0:
+                raise ValueError()
+        except Exception:
+            messagebox.showerror("Invalid", "Age threshold must be a non-negative integer.", parent=self)
+            return
+        export_dir = self.export_var.get().strip()
+        if not export_dir:
+            messagebox.showerror("Missing", "Export folder is required.", parent=self)
+            return
+        try:
+            Path(export_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Cannot create export folder", str(e), parent=self)
+            return
+        time_s = self.time_var.get().strip()
+        try:
+            hh, mm = time_s.split(":")
+            hh, mm = int(hh), int(mm)
+            if not (0 <= hh < 24 and 0 <= mm < 60):
+                raise ValueError()
+        except Exception:
+            messagebox.showerror("Invalid time", "Time must be in HH:MM format (24-hour).", parent=self)
+            return
+
+        run_when_not_logged_in = (self.runmode_var.get() == "not_logged_in")
+        password = None
+        if run_when_not_logged_in:
+            password = self.pwd_var.get()
+            if not password:
+                messagebox.showerror("Password required",
+                                     "Enter your Windows password (it is stored securely by Windows, "
+                                     "never by this utility).", parent=self)
+                return
+
+        dow_map = {"Sunday": 1, "Monday": 2, "Tuesday": 3, "Wednesday": 4,
+                   "Thursday": 5, "Friday": 6, "Saturday": 7}
+
+        self.result = {
+            "name": name,
+            "scan_path": scan_path,
+            "age_days": age,
+            "export_dir": export_dir,
+            "exclusions": list(self._parent_exclusions) if self.use_excl_var.get() else [],
+            "frequency": self.freq_var.get(),
+            "time": f"{hh:02d}:{mm:02d}",
+            "day_of_week": dow_map.get(self.dow_var.get(), 2),
+            "day_of_month": int(self.dom_var.get() or 1),
+            "run_when_not_logged_in": run_when_not_logged_in,
+            "password": password,
+        }
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+def parse_args(argv):
+    p = argparse.ArgumentParser(description=APP_NAME, add_help=True)
+    p.add_argument("--headless-from", metavar="JSON_FILE",
+                   help="Run a scheduled scan defined in the given JSON sidecar (no GUI).")
+    return p.parse_known_args(argv)[0]
+
+
 def main():
+    args = parse_args(sys.argv[1:])
+
+    if args.headless_from:
+        # Headless mode triggered by Task Scheduler — no GUI, just scan + export.
+        sys.exit(run_headless(args.headless_from))
+
     app = StorageCleanupApp()
     app.mainloop()
 
