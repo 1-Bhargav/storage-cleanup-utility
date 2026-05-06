@@ -2,7 +2,7 @@
 
 A portable Windows utility to scan attached or shared storage and delete files older than a configurable age, with a safe, selective workflow. Now with user-defined exclusions and scheduled scans via Windows Task Scheduler.
 
-**Current version: 1.1.0**
+**Current version: 1.1.1**
 
 ## Features
 
@@ -50,13 +50,18 @@ If you have a Windows machine with Python, you can also just double-click `build
 
 1. Click **Use Current Scan Results** (or **Load from CSV…** to use an earlier scan).
 2. Expand folders, uncheck anything you want to keep.
-   - Unchecking a folder unchecks all files inside it (bulk helper).
+   - Unchecking a folder unchecks all currently-visible files inside it (bulk helper).
    - You can re-check specific files inside an unchecked folder to keep them in the delete list.
    - **Rule: only files whose own checkbox is checked get deleted.**
-3. Choose **Recycle Bin** (safer) or **Permanent Delete**.
-4. Click **Dry Run (Preview)** to see exactly what would happen — no deletion.
-5. Click **DELETE Selected**, confirm the warning, and the deletion runs.
-6. Empty folders left behind are cleaned up automatically (if checkbox enabled).
+3. **Search box** — type any text to filter the tree to matching files (matches against filename or path). Useful when you have thousands of files and want to find what to keep.
+   - **Deselect (keep these)** — quickly unchecks every visible (matching) file so they won't be deleted.
+   - **Select** — check every visible file.
+   - **Clear** — empties the search box, all files become visible again.
+   - Checkbox states persist across searches: filter to find what to keep → uncheck them → clear search → those files stay unchecked.
+4. Choose **Recycle Bin** (safer) or **Permanent Delete**.
+5. Click **Dry Run (Preview)** to see exactly what would happen — no deletion.
+6. Click **DELETE Selected**, confirm the warning, and the deletion runs.
+7. Empty folders left behind are cleaned up automatically (if checkbox enabled).
 
 ### Tab 3 — Settings & Schedules
 

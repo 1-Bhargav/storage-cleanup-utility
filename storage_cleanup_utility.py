@@ -50,7 +50,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Storage Cleanup Utility"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # Log and state directory in the user's Documents folder
 USER_DOCS = Path(os.path.expanduser("~")) / "Documents" / "StorageCleanupUtility"
@@ -956,6 +956,11 @@ class StorageCleanupApp(tk.Tk):
 
         # Tree item -> file info map for the Review tab
         self.tree_items = {}   # item_id -> {"type": "folder"|"file", "path": ..., "size": ..., "checked": bool, "file_ref": dict|None}
+        # Path-keyed checked state, persists across tree rebuilds (e.g. when
+        # the user types in the search box, the tree is rebuilt with only the
+        # visible/matching files, but their previous checkbox state is restored
+        # from this dict).
+        self.checked_paths = {}   # full file path -> bool
 
         self.settings = load_state()
         # User-defined exclusion entries — list of dicts {path, pattern, note}
@@ -1131,6 +1136,32 @@ class StorageCleanupApp(tk.Tk):
             value="Total: 0 files, 0 B   |   Selected: 0 files, 0 B"
         )
         ttk.Label(ctrl, textvariable=self.review_summary_var, font=("Segoe UI", 9, "bold")).pack(side=tk.RIGHT)
+
+        # Search row — filters the tree to show only matching files (and their
+        # parent folders for context). Checkbox state is preserved across
+        # filter changes.
+        search = ttk.Frame(f, padding=(6, 4))
+        search.pack(fill=tk.X)
+        ttk.Label(search, text="Search:").pack(side=tk.LEFT)
+        self.review_search_var = tk.StringVar()
+        self.review_search_var.trace_add("write", lambda *a: self._on_review_search_change())
+        search_entry = ttk.Entry(search, textvariable=self.review_search_var, width=50)
+        search_entry.pack(side=tk.LEFT, padx=(4, 6))
+
+        ttk.Button(search, text="Clear", command=lambda: self.review_search_var.set("")).pack(side=tk.LEFT)
+        ttk.Separator(search, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8)
+
+        # Bulk actions limited to currently-visible (filtered) items.
+        # These are the most useful actions when reviewing a search result.
+        ttk.Label(search, text="On visible:").pack(side=tk.LEFT)
+        ttk.Button(search, text="Deselect (keep these)",
+                   command=lambda: self._bulk_check_visible(False)).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(search, text="Select",
+                   command=lambda: self._bulk_check_visible(True)).pack(side=tk.LEFT, padx=(4, 0))
+
+        self.review_search_status_var = tk.StringVar(value="")
+        ttk.Label(search, textvariable=self.review_search_status_var,
+                  foreground="#0066aa").pack(side=tk.LEFT, padx=(12, 0))
 
         # Tree
         tree_frame = ttk.Frame(f, padding=6)
@@ -1718,6 +1749,10 @@ class StorageCleanupApp(tk.Tk):
         if not self.scan_results:
             messagebox.showinfo("No data", "No scan results available. Run a scan first.")
             return
+        # Fresh load — start with everything checked. Clear search.
+        self.checked_paths = {f["path"]: True for f in self.scan_results}
+        if hasattr(self, "review_search_var"):
+            self.review_search_var.set("")
         self.review_source_var.set(
             f"Loaded {len(self.scan_results):,} files from current scan."
         )
@@ -1757,6 +1792,10 @@ class StorageCleanupApp(tk.Tk):
                         "days_old": days_old,
                     })
             self.scan_results = loaded
+            # Fresh load — start with everything checked. Clear search.
+            self.checked_paths = {f["path"]: True for f in self.scan_results}
+            if hasattr(self, "review_search_var"):
+                self.review_search_var.set("")
             self.review_source_var.set(
                 f"Loaded {len(loaded):,} files from CSV: {os.path.basename(path)}"
             )
@@ -1769,9 +1808,32 @@ class StorageCleanupApp(tk.Tk):
             self.review_tree.delete(i)
         self.tree_items.clear()
 
-        # Group by parent folder
-        folder_map = {}  # parent -> list of file dicts
+        # Initialize checkbox state for any newly-seen files (default: checked).
+        # Existing entries in self.checked_paths are preserved across rebuilds.
         for f in self.scan_results:
+            if f["path"] not in self.checked_paths:
+                self.checked_paths[f["path"]] = True
+
+        # Apply search filter (if any)
+        search_q = (self.review_search_var.get() or "").strip().lower() if hasattr(self, "review_search_var") else ""
+        if search_q:
+            visible_files = [f for f in self.scan_results
+                              if search_q in f["name"].lower() or search_q in f["path"].lower()]
+        else:
+            visible_files = list(self.scan_results)
+
+        # Update search status label
+        if hasattr(self, "review_search_status_var"):
+            if search_q:
+                self.review_search_status_var.set(
+                    f"Showing {len(visible_files):,} of {len(self.scan_results):,} files matching '{search_q}'"
+                )
+            else:
+                self.review_search_status_var.set("")
+
+        # Group by parent folder (only visible files)
+        folder_map = {}
+        for f in visible_files:
             folder_map.setdefault(f["parent"], []).append(f)
 
         # Sort files within each folder according to user's choice
@@ -1787,22 +1849,33 @@ class StorageCleanupApp(tk.Tk):
         for parent in sorted_folders:
             files = folder_map[parent]
             total_size = folder_totals[parent]
-            folder_label = f"☑  📁  {parent}    ({len(files):,} files — {format_size(total_size)})"
+            # Folder visual state: ☑ if all visible children checked,
+            # ☐ if none, ◪ if some
+            child_states = [self.checked_paths.get(f["path"], True) for f in files]
+            if all(child_states):
+                fglyph = "☑"
+            elif not any(child_states):
+                fglyph = "☐"
+            else:
+                fglyph = "◪"
+            folder_label = f"{fglyph}  📁  {parent}    ({len(files):,} files — {format_size(total_size)})"
             folder_id = self.review_tree.insert(
                 "", tk.END,
                 text=folder_label,
                 values=("", "", ""),
-                open=False,
+                open=bool(search_q),  # auto-expand when searching
             )
             self.tree_items[folder_id] = {
                 "type": "folder",
                 "path": parent,
                 "size": total_size,
-                "checked": True,
+                "checked": any(child_states),
                 "file_ref": None,
             }
             for fobj in files:
-                file_label = f"☑  📄  {fobj['name']}"
+                checked = self.checked_paths.get(fobj["path"], True)
+                glyph = "☑" if checked else "☐"
+                file_label = f"{glyph}  📄  {fobj['name']}"
                 file_id = self.review_tree.insert(
                     folder_id, tk.END,
                     text=file_label,
@@ -1816,7 +1889,7 @@ class StorageCleanupApp(tk.Tk):
                     "type": "file",
                     "path": fobj["path"],
                     "size": fobj["size"],
-                    "checked": True,
+                    "checked": checked,
                     "file_ref": fobj,
                 }
         self._update_review_summary()
@@ -1863,21 +1936,28 @@ class StorageCleanupApp(tk.Tk):
             return
         new_state = not info["checked"]
         info["checked"] = new_state
-        self._refresh_item_label(item_id)
 
-        # If this is a folder, bulk-toggle all children to the same state (Option B)
-        if info["type"] == "folder":
-            for child in self.review_tree.get_children(item_id):
-                child_info = self.tree_items.get(child)
-                if child_info:
-                    child_info["checked"] = new_state
-                    self._refresh_item_label(child)
-
-        # If this is a file, update parent folder's visual state based on children
         if info["type"] == "file":
+            # Update persistent state and refresh visuals
+            self.checked_paths[info["path"]] = new_state
+            self._refresh_item_label(item_id)
+            # Update parent folder glyph based on its (now-changed) children
             parent = self.review_tree.parent(item_id)
             if parent:
                 self._refresh_folder_visual(parent)
+
+        elif info["type"] == "folder":
+            # Bulk-toggle all currently-VISIBLE children of this folder.
+            # Note: this only affects files visible under this folder right now
+            # (which respects any active search filter — searched-out files are
+            # untouched, intentionally).
+            self._refresh_item_label(item_id)
+            for child in self.review_tree.get_children(item_id):
+                child_info = self.tree_items.get(child)
+                if child_info and child_info["type"] == "file":
+                    child_info["checked"] = new_state
+                    self.checked_paths[child_info["path"]] = new_state
+                    self._refresh_item_label(child)
 
         self._update_review_summary()
 
@@ -1895,7 +1975,7 @@ class StorageCleanupApp(tk.Tk):
 
     def _refresh_folder_visual(self, folder_id):
         """
-        Update folder checkbox glyph based on children state:
+        Update folder checkbox glyph based on its currently-visible children:
         all checked -> ☑, none -> ☐, some -> ◪ (partial)
         """
         info = self.tree_items.get(folder_id)
@@ -1908,7 +1988,7 @@ class StorageCleanupApp(tk.Tk):
         all_on = all(states)
         none_on = not any(states)
 
-        # Folder's own "checked" is true if at least one child is checked
+        # Folder's own "checked" indicator is true if at least one child is checked
         info["checked"] = any(states)
 
         current = self.review_tree.item(folder_id, "text")
@@ -1926,10 +2006,40 @@ class StorageCleanupApp(tk.Tk):
         self.review_tree.item(folder_id, text=prefix + stripped)
 
     def _bulk_check(self, state):
+        """Select All / Deselect All — affects EVERY file (visible or not),
+        because that's what the user expects from a top-level button."""
+        # Update persistent state for every known file
+        for f in self.scan_results:
+            self.checked_paths[f["path"]] = state
+        # Update currently-visible tree items to reflect new state
         for item_id, info in self.tree_items.items():
             info["checked"] = state
             self._refresh_item_label(item_id)
         self._update_review_summary()
+
+    def _bulk_check_visible(self, state):
+        """Select / Deselect only the files currently VISIBLE in the tree
+        (i.e. those matching the current search filter)."""
+        affected = 0
+        for item_id, info in self.tree_items.items():
+            if info["type"] == "file":
+                self.checked_paths[info["path"]] = state
+                info["checked"] = state
+                self._refresh_item_label(item_id)
+                affected += 1
+        # Update folder glyphs to reflect partial states
+        for item_id, info in self.tree_items.items():
+            if info["type"] == "folder":
+                self._refresh_folder_visual(item_id)
+        self._update_review_summary()
+        verb = "selected" if state else "deselected (will NOT be deleted)"
+        self.status_var.set(f"{affected:,} visible files {verb}.")
+
+    def _on_review_search_change(self):
+        """Called every time the user types in the search box. Rebuilds the
+        tree to show only matching files. Checkbox state is preserved across
+        rebuilds via self.checked_paths."""
+        self._rebuild_tree()
 
     def _expand_all(self, expand):
         for item_id, info in self.tree_items.items():
@@ -1937,29 +2047,40 @@ class StorageCleanupApp(tk.Tk):
                 self.review_tree.item(item_id, open=expand)
 
     def _get_selected_files(self):
-        """Return list of file dicts whose file-level checkbox is checked."""
+        """Return list of file dicts whose checkbox is checked.
+        IMPORTANT: this reads from self.checked_paths (the source of truth),
+        NOT from currently-visible tree items. Hidden-by-search files that
+        remain checked WILL be included."""
         selected = []
-        for item_id, info in self.tree_items.items():
-            if info["type"] == "file" and info["checked"]:
-                selected.append(info["file_ref"])
+        for f in self.scan_results:
+            if self.checked_paths.get(f["path"], True):
+                selected.append(f)
         return selected
 
     def _update_review_summary(self):
-        total_files = 0
-        total_size = 0
+        total_files = len(self.scan_results)
+        total_size = sum(f["size"] for f in self.scan_results)
         sel_files = 0
         sel_size = 0
-        for info in self.tree_items.values():
-            if info["type"] == "file":
-                total_files += 1
-                total_size += info["size"]
-                if info["checked"]:
-                    sel_files += 1
-                    sel_size += info["size"]
-        self.review_summary_var.set(
-            f"Total: {total_files:,} files, {format_size(total_size)}   |   "
-            f"Selected: {sel_files:,} files, {format_size(sel_size)}"
-        )
+        for f in self.scan_results:
+            if self.checked_paths.get(f["path"], True):
+                sel_files += 1
+                sel_size += f["size"]
+        # If a search is active, also show how many of the visible items are selected
+        visible_count = sum(1 for info in self.tree_items.values() if info["type"] == "file")
+        visible_sel = sum(1 for info in self.tree_items.values()
+                          if info["type"] == "file" and info["checked"])
+        if visible_count != total_files:
+            self.review_summary_var.set(
+                f"Total: {total_files:,} files, {format_size(total_size)}   |   "
+                f"Selected: {sel_files:,} files, {format_size(sel_size)}   |   "
+                f"Visible: {visible_count:,} ({visible_sel:,} selected)"
+            )
+        else:
+            self.review_summary_var.set(
+                f"Total: {total_files:,} files, {format_size(total_size)}   |   "
+                f"Selected: {sel_files:,} files, {format_size(sel_size)}"
+            )
 
     # ----------------------- Delete actions -----------------------
 
@@ -2159,6 +2280,9 @@ class StorageCleanupApp(tk.Tk):
         # Remove successfully deleted files from the in-memory list and rebuild tree
         deleted_paths = {r["path"] for r in data["results"] if r["status"] == "DELETED"}
         self.scan_results = [f for f in self.scan_results if f["path"] not in deleted_paths]
+        # Also clean up the checkbox-state dict
+        for p in deleted_paths:
+            self.checked_paths.pop(p, None)
         self._rebuild_tree()
 
     # ----------------------- Misc -----------------------
